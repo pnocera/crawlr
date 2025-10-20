@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__web-search-prime__webSearchPrime",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.postman.com)",
+      "WebFetch(domain:www.bookstack.cn)",
+      "WebFetch(domain:docs.crawl4ai.com)",
+      "WebFetch(domain:www.crawl4ai-cloud.com)",
+      "WebFetch(domain:www.pondhouse-data.com)",
+      "Bash(go mod tidy:*)",
+      "Bash(go build:*)",
+      "Bash(rm:*)",
+      "Bash(curl:*)",
+      "Bash(./crawlr.exe:*)",
+      "Bash(go run:*)",
+      "Bash(del:*)",
+      "Bash(./crawlr:*)",
+      "Bash(mkdir:*)"
+    ],
+    "deny": []
+  }
+}
