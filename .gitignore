@@ -38,6 +38,7 @@ libraries
 # Project specific
 *.log
 crawlr.exe
+crawlr
 test-output/
 config/config.yaml.backup
 

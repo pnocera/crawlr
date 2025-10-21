@@ -24,7 +24,9 @@
       "WebFetch(domain:www.crawl4.com)",
       "WebFetch(domain:apidog.com)",
       "WebFetch(domain:community.n8n.io)",
-      "WebFetch(domain:apify.com)"
+      "WebFetch(domain:apify.com)",
+      "WebSearch",
+      "Bash(dir:*)"
     ],
     "deny": []
   }
