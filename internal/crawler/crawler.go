@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	neturl "net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -56,12 +57,27 @@ func (c *Crawler) SetAuthToken(token string) {
 
 // StartCrawlRequest represents the request to start a crawling job
 type StartCrawlRequest struct {
-	Urls                 []string `json:"urls"`                     // URLs array as expected by crawl4ai API
-	IncludeRawHTML       bool     `json:"include_raw_html,omitempty"`
-	WordCountThreshold   int      `json:"word_count_threshold,omitempty"`
-	Priority             int      `json:"priority,omitempty"`
-	TTL                  int      `json:"ttl,omitempty"`
-	// Additional options can be added here as needed
+	Urls                 []string               `json:"urls"`                     // URLs array as expected by crawl4ai API
+	IncludeRawHTML       bool                   `json:"include_raw_html,omitempty"`
+	WordCountThreshold   int                    `json:"word_count_threshold,omitempty"`
+	Priority             int                    `json:"priority,omitempty"`
+	TTL                  int                    `json:"ttl,omitempty"`
+	// Crawl4ai crawler configuration for multi-URL crawling
+	CrawlerConfig        CrawlerConfig          `json:"crawler_config,omitempty"`
+	// Extraction and processing options
+	ProcessURLs          bool                   `json:"process_urls,omitempty"`
+	// Browser configuration for crawling
+	BrowserConfig        map[string]interface{} `json:"browser_config,omitempty"`
+}
+
+// CrawlerConfig contains configuration for automatic URL discovery and crawling
+type CrawlerConfig struct {
+	MaxDepth        int    `json:"max_depth,omitempty"`
+	MaxURLs         int    `json:"max_urls,omitempty"`
+	Strategy        string `json:"strategy,omitempty"`        // bfs, dfs, bestfirst
+	ExternalLinks   bool   `json:"external_links,omitempty"` // false = stay in domain
+	OnlyText        bool   `json:"only_text,omitempty"`
+	WordCountThreshold int `json:"word_count_threshold,omitempty"`
 }
 
 // StartCrawlResponse represents the response from starting a crawling job
@@ -88,25 +104,7 @@ type StartCrawlResponse struct {
 	ServerPeakMemoryMB   float64 `json:"server_peak_memory_mb"`
 }
 
-// JobStatus represents the status of a crawling job
-type JobStatus struct {
-	Success bool `json:"success"`
-	Results []struct {
-		URL      string `json:"url"`
-		Success  bool   `json:"success"`
-		HTML     string `json:"html"`
-		Markdown struct {
-			RawMarkdown string `json:"raw_markdown"`
-		} `json:"markdown"`
-		Media struct {
-			Images []struct {
-				URL string `json:"url"`
-			} `json:"images"`
-		} `json:"media"`
-	} `json:"results"`
-}
-
-// CrawlResult represents the result of a completed crawling job
+// CrawlResult represents a crawl result for media processing compatibility
 type CrawlResult struct {
 	Success bool `json:"success"`
 	Results []struct {
@@ -147,11 +145,27 @@ func (e *APIError) Error() string {
 
 // StartCrawl starts a new crawling job with the provided URL and options
 func (c *Crawler) StartCrawl(ctx context.Context, url string, includeMedia *bool) (*StartCrawlResponse, error) {
+	return c.StartCrawlWithConfig(ctx, []string{url}, includeMedia, 2, true, 50)
+}
+
+// StartCrawlWithConfig starts a crawling job with custom configuration
+func (c *Crawler) StartCrawlWithConfig(ctx context.Context, urls []string, includeMedia *bool, maxDepth int, excludeExternalLinks bool, maxURLs int) (*StartCrawlResponse, error) {
+	// Optimize for batch processing: disable internal URL discovery when doing our own discovery
+	discoveryEnabled := len(urls) == 1 // Only enable discovery for single URL calls
+	
+	// Use the format that matches crawl4ai's expected structure
 	req := StartCrawlRequest{
-		Urls:               []string{url}, // Use URLs array format as expected by crawl4ai API
-		IncludeRawHTML:     true,           // Include raw HTML in response
-		WordCountThreshold: 10,             // Set minimum word count threshold
-		Priority:           10,             // Set a default priority as per the documentation
+		Urls:           urls,   // Use URLs array format as expected by crawl4ai API
+		IncludeRawHTML: true,   // Include raw HTML in response
+		ProcessURLs:    discoveryEnabled,   // Enable URL processing only for single URLs
+		CrawlerConfig: CrawlerConfig{
+			MaxDepth:         maxDepth,        // Limit crawling depth
+			MaxURLs:          maxURLs,         // Limit total URLs to crawl
+			Strategy:         "bfs",           // Use breadth-first search for comprehensive crawling
+			ExternalLinks:    false,           // Stay within the same domain
+			OnlyText:         true,            // Focus on text content
+			WordCountThreshold: 10,           // Skip low-content pages
+		},
 	}
 
 	reqBody, err := json.Marshal(req)
@@ -159,7 +173,9 @@ func (c *Crawler) StartCrawl(ctx context.Context, url string, includeMedia *bool
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	apiURL := fmt.Sprintf("%s/crawl", c.serverURL)
+	// Remove trailing slash from server URL if present
+	serverURL := strings.TrimSuffix(c.serverURL, "/")
+	apiURL := fmt.Sprintf("%s/crawl", serverURL)
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -170,7 +186,21 @@ func (c *Crawler) StartCrawl(ctx context.Context, url string, includeMedia *bool
 		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
 	}
 
-	c.logger.Info("Starting crawl for URL", map[string]interface{}{"url": url})
+	c.logger.Info("Starting crawl for URLs", map[string]interface{}{
+		"urlCount": len(urls),
+		"maxDepth": maxDepth,
+		"maxURLs": maxURLs,
+		"excludeExternal": excludeExternalLinks,
+		"discoveryEnabled": discoveryEnabled,
+		"isBatch": len(urls) > 1,
+		"crawlerConfig": map[string]interface{}{
+			"process_urls": discoveryEnabled,
+			"strategy": "bfs",
+			"external_links": false,
+			"only_text": true,
+			"word_count_threshold": 10,
+		},
+	})
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
@@ -183,6 +213,10 @@ func (c *Crawler) StartCrawl(ctx context.Context, url string, includeMedia *bool
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	c.logger.Debug("Request sent", map[string]interface{}{
+		"requestBody": string(reqBody),
+	})
+	
 	c.logger.Debug("Start crawl response", map[string]interface{}{
 		"statusCode": resp.StatusCode,
 		"body":       string(body),
@@ -202,101 +236,700 @@ func (c *Crawler) StartCrawl(ctx context.Context, url string, includeMedia *bool
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
+	c.logger.Info("Crawl completed", map[string]interface{}{
+		"success": result.Success,
+		"resultCount": len(result.Results),
+		"processingTime": result.ServerProcessingTimeS,
+	})
+	
+	// If we only got one result but expected more, log a warning
+	if len(urls) == 1 && maxURLs > 1 && len(result.Results) == 1 {
+		c.logger.Warn("Expected multiple URLs but got only one result. The crawl4ai server may not support multi-URL crawling or different parameters are needed.", map[string]interface{}{
+			"requestedURLs": maxURLs,
+			"actualResults": len(result.Results),
+			"startingURL": urls[0],
+		})
+	}
+
 	return &result, nil
 }
 
-// GetJobStatus retrieves the status of a crawling job
-func (c *Crawler) GetJobStatus(ctx context.Context, taskID string) (*JobStatus, error) {
-	apiURL := fmt.Sprintf("%s/crawl/job/%s", c.serverURL, taskID)
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	if c.authToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
-	}
-
-	c.logger.Info("Checking job status", map[string]interface{}{"taskID": taskID})
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	c.logger.Debug("Job status response", map[string]interface{}{
-		"statusCode": resp.StatusCode,
-		"body":       string(body),
-	})
-
-	if resp.StatusCode != http.StatusOK {
-		var apiErr APIError
-		if err := json.Unmarshal(body, &apiErr); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal error response: %w, status code: %d", err, resp.StatusCode)
+// ExtractURLsFromHTML extracts URLs from HTML content using regex
+func (c *Crawler) ExtractURLsFromHTML(html string, baseURL string) ([]string, error) {
+	// Simple regex to find href attributes
+	hrefRegex := regexp.MustCompile(`<a[^>]+href\s*=\s*["']([^"']+)["'][^>]*>`)
+	matches := hrefRegex.FindAllStringSubmatch(html, -1)
+	
+	var urls []string
+	seen := make(map[string]bool)
+	
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
 		}
-		apiErr.StatusCode = resp.StatusCode
-		return nil, &apiErr
+		
+		url := strings.TrimSpace(match[1])
+		
+		// Skip anchors, javascript, mailto, etc.
+		if strings.HasPrefix(url, "#") || strings.HasPrefix(url, "javascript:") || strings.HasPrefix(url, "mailto:") {
+			continue
+		}
+		
+		// Make URL absolute
+		absoluteURL, err := c.makeAbsoluteURL(url, baseURL)
+		if err != nil {
+			c.logger.Debug("Failed to make URL absolute", map[string]interface{}{
+				"url": url,
+				"baseURL": baseURL,
+				"error": err,
+			})
+			continue
+		}
+		
+		// Skip if already seen
+		if seen[absoluteURL] {
+			continue
+		}
+		
+		seen[absoluteURL] = true
+		urls = append(urls, absoluteURL)
 	}
-
-	var status JobStatus
-	if err := json.Unmarshal(body, &status); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	return &status, nil
+	
+	c.logger.Info("Extracted URLs from HTML", map[string]interface{}{
+		"totalURLs": len(urls),
+		"baseURL": baseURL,
+	})
+	
+	return urls, nil
 }
 
-// GetCrawlResult retrieves the results of a completed crawling job
-func (c *Crawler) GetCrawlResult(ctx context.Context, taskID string) (*CrawlResult, error) {
-	apiURL := fmt.Sprintf("%s/crawl/job/%s", c.serverURL, taskID)
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+// makeAbsoluteURL converts a relative URL to absolute URL
+func (c *Crawler) makeAbsoluteURL(url, baseURL string) (string, error) {
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		return url, nil
+	}
+	
+	base, err := neturl.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return "", fmt.Errorf("failed to parse base URL: %w", err)
 	}
-
-	if c.authToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
-	}
-
-	c.logger.Info("Retrieving crawl result", map[string]interface{}{"taskID": taskID})
-
-	resp, err := c.client.Do(httpReq)
+	
+	rel, err := neturl.Parse(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
+		return "", fmt.Errorf("failed to parse relative URL: %w", err)
 	}
-	defer resp.Body.Close()
+	
+	return base.ResolveReference(rel).String(), nil
+}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
+// URLWithDepth represents a URL with its crawl depth
+type URLWithDepth struct {
+	URL   string
+	Depth int
+}
 
-	c.logger.Debug("Crawl result response", map[string]interface{}{
-		"statusCode": resp.StatusCode,
-		"bodySize":   len(body),
+// StartRecursiveCrawling performs true recursive crawling with depth-based discovery
+func (c *Crawler) StartRecursiveCrawling(ctx context.Context, startURL string, includeMedia *bool, maxDepth int, maxURLs int) (*StartCrawlResponse, error) {
+	return c.StartBatchRecursiveCrawling(ctx, startURL, includeMedia, maxDepth, maxURLs, 5)
+}
+
+// StartBatchRecursiveCrawling performs recursive crawling with batch processing for efficiency
+func (c *Crawler) StartBatchRecursiveCrawling(ctx context.Context, startURL string, includeMedia *bool, maxDepth int, maxURLs int, batchSize int) (*StartCrawlResponse, error) {
+	c.logger.Info("Starting batch recursive crawling", map[string]interface{}{
+		"startURL": startURL,
+		"maxDepth": maxDepth,
+		"maxURLs": maxURLs,
+		"batchSize": batchSize,
 	})
-
-	if resp.StatusCode != http.StatusOK {
-		var apiErr APIError
-		if err := json.Unmarshal(body, &apiErr); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal error response: %w, status code: %d", err, resp.StatusCode)
+	
+	// Initialize crawling state
+	frontier := []URLWithDepth{{URL: startURL, Depth: 0}}
+	visited := make(map[string]bool)
+	
+	c.logger.Info("Batch recursive crawling initialized", map[string]interface{}{
+		"startURL": startURL,
+		"maxDepth": maxDepth,
+		"maxURLs": maxURLs,
+		"batchSize": batchSize,
+		"initialFrontierSize": len(frontier),
+	})
+	var allResults []struct {
+		URL             string `json:"url"`
+		HTML            string `json:"html"`
+		Success         bool   `json:"success"`
+		CleanedHTML     string `json:"cleaned_html"`
+		Markdown        struct {
+			RawMarkdown         string `json:"raw_markdown"`
+			MarkdownWithCitations string `json:"markdown_with_citations"`
+		} `json:"markdown"`
+		Media           struct {
+			Images []struct {
+				URL string `json:"url"`
+			} `json:"images"`
+		} `json:"media"`
+		Metadata        map[string]interface{} `json:"metadata"`
+	}
+	
+	// Progress reporter will be managed by the caller
+	
+	for len(frontier) > 0 && len(allResults) < maxURLs {
+		// Check context for cancellation
+		select {
+		case <-ctx.Done():
+			c.logger.Warn("Batch crawling cancelled by context", map[string]interface{}{
+				"processedURLs": len(allResults),
+				"remainingFrontier": len(frontier),
+			})
+			break
+		default:
 		}
-		apiErr.StatusCode = resp.StatusCode
-		return nil, &apiErr
+		
+		// Process URLs in batches for efficiency
+		batchSizeToProcess := min(batchSize, min(len(frontier), maxURLs-len(allResults)))
+		if batchSizeToProcess <= 0 {
+			break
+		}
+		
+		// Extract current batch
+		var currentBatch []URLWithDepth
+		for i := 0; i < batchSizeToProcess; i++ {
+			if i >= len(frontier) {
+				break
+			}
+			current := frontier[i]
+			
+			// Skip if already visited or too deep
+			if !visited[current.URL] && current.Depth <= maxDepth {
+				currentBatch = append(currentBatch, current)
+			}
+		}
+		
+		// Remove processed URLs from frontier
+		frontier = frontier[batchSizeToProcess:]
+		
+		if len(currentBatch) == 0 {
+			continue
+		}
+		
+		c.logger.Info("Processing batch", map[string]interface{}{
+			"batchSize": len(currentBatch),
+			"batchDepth": currentBatch[0].Depth,
+			"processedCount": len(allResults),
+			"remainingFrontier": len(frontier),
+		})
+		
+		// Extract URLs for batch processing
+		var batchURLs []string
+		for _, item := range currentBatch {
+			batchURLs = append(batchURLs, item.URL)
+			visited[item.URL] = true
+		}
+		
+		// Crawl the batch with optimized parameters for batch processing
+		result, err := c.StartCrawlWithRetry(ctx, batchURLs, includeMedia, 1, true, len(batchURLs), 1)
+		if err != nil {
+			c.logger.Warn("Failed to crawl batch", map[string]interface{}{
+				"batchSize": len(batchURLs),
+				"error": err,
+			})
+			continue
+		}
+		
+		if len(result.Results) == 0 {
+			continue
+		}
+		
+		// Add results and extract new URLs
+		var newFrontierItems []URLWithDepth
+		for i, crawlResult := range result.Results {
+			if i >= len(currentBatch) {
+				break // Safety check
+			}
+			
+			// Add to results
+			allResults = append(allResults, crawlResult)
+			
+			// Extract URLs from this page if we haven't reached max depth
+			if currentBatch[i].Depth < maxDepth {
+				html := crawlResult.HTML
+				extractedURLs, err := c.ExtractURLsFromHTML(html, crawlResult.URL)
+				if err != nil {
+					c.logger.Warn("Failed to extract URLs from page", map[string]interface{}{
+						"url": crawlResult.URL,
+						"error": err,
+					})
+					continue
+				}
+				
+				// Filter and add new URLs to frontier
+				filteredURLs := c.filterURLsForRecursive(extractedURLs, startURL, visited)
+				for _, url := range filteredURLs {
+					if len(visited) < maxURLs {
+						newFrontierItems = append(newFrontierItems, URLWithDepth{
+							URL:   url,
+							Depth: currentBatch[i].Depth + 1,
+						})
+					}
+				}
+			}
+		}
+		
+		// Add new URLs to frontier
+		frontier = append(newFrontierItems, frontier...)
+		
+		c.logger.Info("Batch completed", map[string]interface{}{
+			"batchSize": len(batchURLs),
+			"resultsCount": len(result.Results),
+			"newURLs": len(newFrontierItems),
+			"frontierSize": len(frontier),
+			"visitedCount": len(visited),
+			"processedCount": len(allResults),
+			"maxURLs": maxURLs,
+		})
+	}
+	
+	// Log frontier exhaustion
+	if len(frontier) == 0 {
+		c.logger.Info("Frontier exhausted - batch crawling completed", map[string]interface{}{
+			"finalProcessedCount": len(allResults),
+			"totalVisited": len(visited),
+			"maxURLsReached": len(visited) >= maxURLs,
+		})
+	}
+	
+	// Create combined response
+	combinedResponse := &StartCrawlResponse{
+		Success: len(allResults) > 0,
+		Results: allResults,
+	}
+	
+	c.logger.Info("Batch recursive crawling completed", map[string]interface{}{
+		"totalResults": len(allResults),
+		"visitedURLs": len(visited),
+		"startURL": startURL,
+		"maxDepth": maxDepth,
+		"maxURLs": maxURLs,
+		"batchSize": batchSize,
+	})
+	
+	return combinedResponse, nil
+}
+
+// filterURLs filters URLs to stay within domain and limits the count
+func (c *Crawler) filterURLs(urls []string, baseURL string, maxCount int) []string {
+	var filtered []string
+	base, err := neturl.Parse(baseURL)
+	if err != nil {
+		c.logger.Error("Failed to parse base URL for filtering", map[string]interface{}{
+			"baseURL": baseURL,
+			"error": err,
+		})
+		return urls[:min(maxCount, len(urls))]
+	}
+	
+	baseDomain := base.Hostname()
+	
+	for _, url := range urls {
+		if len(filtered) >= maxCount {
+			break
+		}
+		
+		parsed, err := neturl.Parse(url)
+		if err != nil {
+			continue
+		}
+		
+		// Stay within the same domain
+		if parsed.Hostname() == baseDomain {
+			filtered = append(filtered, url)
+		}
+	}
+	
+	c.logger.Info("Filtered URLs", map[string]interface{}{
+		"originalCount": len(urls),
+		"filteredCount": len(filtered),
+		"baseDomain": baseDomain,
+		"maxCount": maxCount,
+	})
+	
+	return filtered
+}
+
+// filterURLsForRecursive filters URLs for recursive crawling, avoiding already visited URLs
+func (c *Crawler) filterURLsForRecursive(urls []string, baseURL string, visited map[string]bool) []string {
+	var filtered []string
+	base, err := neturl.Parse(baseURL)
+	if err != nil {
+		c.logger.Error("Failed to parse base URL for filtering", map[string]interface{}{
+			"baseURL": baseURL,
+			"error": err,
+		})
+		return urls
+	}
+	
+	baseDomain := base.Hostname()
+	
+	for _, url := range urls {
+		// Skip if already visited
+		if visited[url] {
+			continue
+		}
+		
+		parsed, err := neturl.Parse(url)
+		if err != nil {
+			continue
+		}
+		
+		// Stay within the same domain
+		if parsed.Hostname() == baseDomain {
+			filtered = append(filtered, url)
+		}
+	}
+	
+	// Sort URLs by priority (high-value discovery pages first)
+	filtered = c.prioritizeURLs(filtered)
+	
+	c.logger.Info("Filtered URLs for recursive crawling", map[string]interface{}{
+		"originalCount": len(urls),
+		"filteredCount": len(filtered),
+		"baseDomain": baseDomain,
+		"visitedCount": len(visited),
+	})
+	
+	return filtered
+}
+
+// prioritizeURLs sorts URLs based on their likelihood to contain many links
+// High-value discovery pages (overviews, indexes, docs) are prioritized
+func (c *Crawler) prioritizeURLs(urls []string) []string {
+	if len(urls) <= 1 {
+		return urls
+	}
+	
+	// Define high-value discovery patterns
+	discoveryPatterns := []string{
+		"/overview",
+		"/docs", 
+		"/documentation",
+		"/api",
+		"/components",
+		"/reference",
+		"/guides",
+		"/examples",
+		"/tutorials",
+		"/index",
+		"/introduction",
+		"/getting-started",
+	}
+	
+	// Calculate priority scores
+	type URLScore struct {
+		URL   string
+		Score int
+	}
+	
+	var scoredURLs []URLScore
+	for _, url := range urls {
+		score := 0
+		lowerURL := strings.ToLower(url)
+		
+		// High priority for discovery patterns
+		for _, pattern := range discoveryPatterns {
+			if strings.Contains(lowerURL, pattern) {
+				score += 10
+				break
+			}
+		}
+		
+		// Additional scoring based on URL characteristics
+		if strings.Contains(lowerURL, "/list") {
+			score += 8
+		}
+		if strings.HasSuffix(lowerURL, "/") {
+			score += 3 // Index pages
+		}
+		if !strings.Contains(lowerURL, "#") {
+			score += 2 // Prefer pages without anchors
+		}
+		
+		// Penalize certain patterns
+		if strings.Contains(lowerURL, "/demo") ||
+		   strings.Contains(lowerURL, "/example") ||
+		   strings.Contains(lowerURL, "/playground") {
+			score -= 5
+		}
+		
+		scoredURLs = append(scoredURLs, URLScore{URL: url, Score: score})
+	}
+	
+	// Sort by score (descending)
+	for i := 0; i < len(scoredURLs)-1; i++ {
+		for j := i + 1; j < len(scoredURLs); j++ {
+			if scoredURLs[j].Score > scoredURLs[i].Score {
+				scoredURLs[i], scoredURLs[j] = scoredURLs[j], scoredURLs[i]
+			}
+		}
+	}
+	
+	// Extract sorted URLs
+	var result []string
+	for _, scored := range scoredURLs {
+		result = append(result, scored.URL)
+	}
+	
+	c.logger.Debug("URL prioritization completed", map[string]interface{}{
+		"urlCount": len(urls),
+		"topScore": func() int { if len(scoredURLs) > 0 { return scoredURLs[0].Score } else { return 0 } }(),
+		"samplePrioritized": func() []string { 
+			if len(result) > 3 { 
+				return result[:3] 
+			} else { 
+				return result 
+			} 
+		}(),
+	})
+	
+	return result
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// StartCrawlWithRetry starts a crawling job with retry logic
+func (c *Crawler) StartCrawlWithRetry(ctx context.Context, urls []string, includeMedia *bool, maxDepth int, excludeExternalLinks bool, maxURLs int, maxRetries int) (*StartCrawlResponse, error) {
+	var lastErr error
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			c.logger.Info("Retrying crawl", map[string]interface{}{
+				"attempt": attempt + 1,
+				"maxRetries": maxRetries + 1,
+				"urlCount": len(urls),
+			})
+			
+			// Add exponential backoff
+			backoffDuration := time.Duration(attempt*attempt) * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoffDuration):
+				// Continue with retry
+			}
+		}
+		
+		result, err := c.StartCrawlWithConfig(ctx, urls, includeMedia, maxDepth, excludeExternalLinks, maxURLs)
+		if err == nil {
+			return result, nil
+		}
+		
+		lastErr = err
+		c.logger.Warn("Crawl attempt failed", map[string]interface{}{
+			"attempt": attempt + 1,
+			"error": err,
+			"urlCount": len(urls),
+		})
+	}
+	
+	return nil, fmt.Errorf("crawl failed after %d attempts: %w", maxRetries+1, lastErr)
+}
+
+// CreateSingleResultResponse creates a StartCrawlResponse for a single result
+func (c *Crawler) CreateSingleResultResponse(result interface{}) *StartCrawlResponse {
+	return &StartCrawlResponse{
+		Success: true,
+		Results: []struct {
+			URL             string `json:"url"`
+			HTML            string `json:"html"`
+			Success         bool   `json:"success"`
+			CleanedHTML     string `json:"cleaned_html"`
+			Markdown        struct {
+				RawMarkdown         string `json:"raw_markdown"`
+				MarkdownWithCitations string `json:"markdown_with_citations"`
+			} `json:"markdown"`
+			Media           struct {
+				Images []struct {
+					URL string `json:"url"`
+				} `json:"images"`
+			} `json:"media"`
+			Metadata        map[string]interface{} `json:"metadata"`
+		}{result.(struct {
+			URL             string `json:"url"`
+			HTML            string `json:"html"`
+			Success         bool   `json:"success"`
+			CleanedHTML     string `json:"cleaned_html"`
+			Markdown        struct {
+				RawMarkdown         string `json:"raw_markdown"`
+				MarkdownWithCitations string `json:"markdown_with_citations"`
+			} `json:"markdown"`
+			Media           struct {
+				Images []struct {
+					URL string `json:"url"`
+				} `json:"images"`
+			} `json:"media"`
+			Metadata        map[string]interface{} `json:"metadata"`
+		})},
+	}
+}
+
+// ConvertToCrawlResult converts StartCrawlResponse to CrawlResult for media processing
+func (r *StartCrawlResponse) ConvertToCrawlResult() *CrawlResult {
+	if len(r.Results) == 0 {
+		return &CrawlResult{Success: r.Success, Results: []struct {
+			URL      string `json:"url"`
+			Success  bool   `json:"success"`
+			HTML     string `json:"html"`
+			Markdown struct {
+				RawMarkdown string `json:"raw_markdown"`
+			} `json:"markdown"`
+			Media struct {
+				Images []struct {
+					URL string `json:"url"`
+				} `json:"images"`
+			} `json:"media"`
+			Metadata map[string]interface{} `json:"metadata,omitempty"`
+		}{}}
+	}
+	
+	result := &CrawlResult{
+		Success: r.Success,
+		Results: make([]struct {
+			URL      string `json:"url"`
+			Success  bool   `json:"success"`
+			HTML     string `json:"html"`
+			Markdown struct {
+				RawMarkdown string `json:"raw_markdown"`
+			} `json:"markdown"`
+			Media struct {
+				Images []struct {
+					URL string `json:"url"`
+				} `json:"images"`
+			} `json:"media"`
+			Metadata map[string]interface{} `json:"metadata,omitempty"`
+		}, len(r.Results)),
+	}
+	
+	for i, res := range r.Results {
+		result.Results[i] = struct {
+			URL      string `json:"url"`
+			Success  bool   `json:"success"`
+			HTML     string `json:"html"`
+			Markdown struct {
+				RawMarkdown string `json:"raw_markdown"`
+			} `json:"markdown"`
+			Media struct {
+				Images []struct {
+					URL string `json:"url"`
+				} `json:"images"`
+			} `json:"media"`
+			Metadata map[string]interface{} `json:"metadata,omitempty"`
+		}{
+			URL:     res.URL,
+			Success: res.Success,
+			HTML:    res.HTML,
+			Markdown: struct {
+				RawMarkdown string `json:"raw_markdown"`
+			}{
+				RawMarkdown: res.Markdown.RawMarkdown,
+			},
+			Media:    res.Media,
+			Metadata: res.Metadata,
+		}
+	}
+	
+	return result
+}
+
+// DownloadAndSaveMediaFromStartResponse downloads and saves media files directly from StartCrawlResponse
+func (c *Crawler) DownloadAndSaveMediaFromStartResponse(ctx context.Context, startResp *StartCrawlResponse, progressReporter *progress.ProgressReporter) ([]*storage.FileInfo, error) {
+	if !c.includeMedia || len(startResp.Results) == 0 || len(startResp.Results[0].Media.Images) == 0 {
+		return nil, nil
 	}
 
-	var result CrawlResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	if c.storage == nil {
+		return nil, errors.New(errors.StorageError, "storage not initialized")
 	}
 
-	return &result, nil
+	var savedFiles []*storage.FileInfo
+
+	for i, mediaFile := range startResp.Results[0].Media.Images {
+		select {
+		case <-ctx.Done():
+			return savedFiles, ctx.Err()
+		default:
+		}
+
+		// Update progress
+		progressReporter.SetCurrent(i)
+
+		// Resolve the media URL
+		mediaURL, err := neturl.Parse(mediaFile.URL)
+		if err != nil {
+			c.logger.Error("Failed to resolve media URL", map[string]interface{}{
+				"url":   mediaFile.URL,
+				"error": err,
+			})
+			continue
+		}
+
+		// Make the media URL absolute if it's relative
+		if !mediaURL.IsAbs() {
+			baseURL, err := neturl.Parse(startResp.Results[0].URL)
+			if err != nil {
+				c.logger.Error("Failed to parse base URL", map[string]interface{}{
+					"url":   startResp.Results[0].URL,
+					"error": err,
+				})
+				continue
+			}
+			mediaURL = baseURL.ResolveReference(mediaURL)
+		}
+
+		// Download the media file
+		resp, err := c.client.Get(mediaURL.String())
+		if err != nil {
+			c.logger.Error("Failed to download media file", map[string]interface{}{
+				"url":   mediaURL.String(),
+				"error": err,
+			})
+			continue
+		}
+		defer resp.Body.Close()
+
+		// Check if the response is successful
+		if resp.StatusCode != http.StatusOK {
+			c.logger.Error("Failed to download media file", map[string]interface{}{
+				"url":        mediaURL.String(),
+				"statusCode": resp.StatusCode,
+			})
+			continue
+		}
+
+		// Save the media file
+		fileInfo, err := c.storage.SaveMediaFile(resp.Body, mediaURL.String(), "")
+		if err != nil {
+			c.logger.Error("Failed to save media file", map[string]interface{}{
+				"url":   mediaURL.String(),
+				"error": err,
+			})
+			continue
+		}
+
+		c.logger.Info("Saved media file", map[string]interface{}{
+			"path": fileInfo.Path,
+			"size": fileInfo.Size,
+		})
+
+		savedFiles = append(savedFiles, fileInfo)
+	}
+
+	// Mark progress as complete
+	progressReporter.SetCurrent(len(startResp.Results[0].Media.Images))
+
+	return savedFiles, nil
 }
 
 // DownloadAndSaveMedia downloads and saves media files from the crawl result
@@ -373,7 +1006,7 @@ func (c *Crawler) DownloadAndSaveMediaWithProgress(ctx context.Context, result *
 		progressReporter.SetCurrent(i)
 
 		// Resolve the media URL
-		mediaURL, err := url.Parse(mediaFile.URL)
+		mediaURL, err := neturl.Parse(mediaFile.URL)
 		if err != nil {
 			c.logger.Error("Failed to resolve media URL", map[string]interface{}{
 				"url":   mediaFile.URL,
@@ -384,7 +1017,7 @@ func (c *Crawler) DownloadAndSaveMediaWithProgress(ctx context.Context, result *
 
 		// Make the media URL absolute if it's relative
 		if !mediaURL.IsAbs() {
-			baseURL, err := url.Parse(result.Results[0].URL)
+			baseURL, err := neturl.Parse(result.Results[0].URL)
 			if err != nil {
 				c.logger.Error("Failed to parse base URL", map[string]interface{}{
 					"url":   result.Results[0].URL,
@@ -453,13 +1086,13 @@ func (c *Crawler) resolveURL(metadata map[string]interface{}, mediaURL string) (
 	}
 
 	// Parse the base URL
-	baseURL, err := url.Parse(baseURLStr)
+	baseURL, err := neturl.Parse(baseURLStr)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse base URL: %w", err)
 	}
 
 	// Parse the media URL
-	mediaURLParsed, err := url.Parse(mediaURL)
+	mediaURLParsed, err := neturl.Parse(mediaURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse media URL: %w", err)
 	}

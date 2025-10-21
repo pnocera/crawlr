@@ -3,3 +3,17 @@ max_concurrent: 5
 overwrite_files: false
 server_url: http://192.168.1.27:8888/
 timeout: 30
+
+# Crawling configuration
+max_depth: 2
+discovery_method: auto
+batch_size: 5
+exclude_patterns: ""
+max_urls: 50
+
+# Logging configuration
+log_level: INFO
+log_output: console
+log_file_path: crawlr.log
+log_include_time: true
+log_structured: true

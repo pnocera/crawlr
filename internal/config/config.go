@@ -20,6 +20,13 @@ type Config struct {
 	Library        string `mapstructure:"library"`
 	Output         string `mapstructure:"output"`
 
+	// Crawling configuration
+	MaxDepth        int    `mapstructure:"max_depth"`
+	DiscoveryMethod string `mapstructure:"discovery_method"`
+	BatchSize       int    `mapstructure:"batch_size"`
+	ExcludePatterns string `mapstructure:"exclude_patterns"`
+	MaxURLs         int    `mapstructure:"max_urls"`
+
 	// Logging configuration
 	LogLevel       string `mapstructure:"log_level"`
 	LogOutput      string `mapstructure:"log_output"`
@@ -36,6 +43,13 @@ func DefaultConfig() *Config {
 		MaxConcurrent:  5,
 		IncludeMedia:   true,
 		OverwriteFiles: false,
+		// Crawling defaults
+		MaxDepth:        2,
+		DiscoveryMethod: "auto",
+		BatchSize:       5,
+		ExcludePatterns: "",
+		MaxURLs:         50,
+		// Logging defaults
 		LogLevel:       "INFO",
 		LogOutput:      "console",
 		LogFilePath:    "crawlr.log",
@@ -55,6 +69,13 @@ func LoadConfig() (*Config, error) {
 	v.SetDefault("max_concurrent", config.MaxConcurrent)
 	v.SetDefault("include_media", config.IncludeMedia)
 	v.SetDefault("overwrite_files", config.OverwriteFiles)
+	// Crawling defaults
+	v.SetDefault("max_depth", config.MaxDepth)
+	v.SetDefault("discovery_method", config.DiscoveryMethod)
+	v.SetDefault("batch_size", config.BatchSize)
+	v.SetDefault("exclude_patterns", config.ExcludePatterns)
+	v.SetDefault("max_urls", config.MaxURLs)
+	// Logging defaults
 	v.SetDefault("log_level", config.LogLevel)
 	v.SetDefault("log_output", config.LogOutput)
 	v.SetDefault("log_file_path", config.LogFilePath)
@@ -108,6 +129,13 @@ func LoadConfigWithViper(v *viper.Viper) (*Config, error) {
 	v.SetDefault("max_concurrent", config.MaxConcurrent)
 	v.SetDefault("include_media", config.IncludeMedia)
 	v.SetDefault("overwrite_files", config.OverwriteFiles)
+	// Crawling defaults
+	v.SetDefault("max_depth", config.MaxDepth)
+	v.SetDefault("discovery_method", config.DiscoveryMethod)
+	v.SetDefault("batch_size", config.BatchSize)
+	v.SetDefault("exclude_patterns", config.ExcludePatterns)
+	v.SetDefault("max_urls", config.MaxURLs)
+	// Logging defaults
 	v.SetDefault("log_level", config.LogLevel)
 	v.SetDefault("log_output", config.LogOutput)
 	v.SetDefault("log_file_path", config.LogFilePath)
@@ -170,6 +198,13 @@ func createDefaultConfigFile(configDir, configName string) error {
 	v.Set("max_concurrent", defaultConfig.MaxConcurrent)
 	v.Set("include_media", defaultConfig.IncludeMedia)
 	v.Set("overwrite_files", defaultConfig.OverwriteFiles)
+	// Crawling defaults
+	v.Set("max_depth", defaultConfig.MaxDepth)
+	v.Set("discovery_method", defaultConfig.DiscoveryMethod)
+	v.Set("batch_size", defaultConfig.BatchSize)
+	v.Set("exclude_patterns", defaultConfig.ExcludePatterns)
+	v.Set("max_urls", defaultConfig.MaxURLs)
+	// Logging defaults
 	v.Set("log_level", defaultConfig.LogLevel)
 	v.Set("log_output", defaultConfig.LogOutput)
 	v.Set("log_file_path", defaultConfig.LogFilePath)

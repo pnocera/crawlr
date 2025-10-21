@@ -16,7 +16,15 @@
       "Bash(go run:*)",
       "Bash(del:*)",
       "Bash(./crawlr:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(ls:*)",
+      "Bash(powershell:*)",
+      "WebFetch(domain:www.scrapingbee.com)",
+      "WebFetch(domain:www.aidoczh.com)",
+      "WebFetch(domain:www.crawl4.com)",
+      "WebFetch(domain:apidog.com)",
+      "WebFetch(domain:community.n8n.io)",
+      "WebFetch(domain:apify.com)"
     ],
     "deny": []
   }

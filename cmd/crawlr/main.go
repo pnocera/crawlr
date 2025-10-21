@@ -46,6 +46,11 @@ to extract content from websites and store markdown and media files locally.`,
 			"max-concurrent":   "max_concurrent",
 			"include-media":    "include_media",
 			"overwrite-files":  "overwrite_files",
+			"max-depth":        "max_depth",
+			"discovery-method": "discovery_method",
+			"batch-size":       "batch_size",
+			"exclude-patterns": "exclude_patterns",
+			"max-urls":         "max_urls",
 			"log-level":        "log_level",
 			"log-output":       "log_output",
 			"log-file-path":    "log_file_path",
@@ -156,8 +161,18 @@ to extract content from websites and store markdown and media files locally.`,
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
 		defer cancel()
 
-		appLogger.Info("Starting crawl for URL", map[string]interface{}{"url": cfg.URL})
-		startResp, err := c.StartCrawl(ctx, cfg.URL, nil)
+		appLogger.Info("Starting crawl", map[string]interface{}{
+			"url": cfg.URL,
+			"maxDepth": cfg.MaxDepth,
+			"discoveryMethod": cfg.DiscoveryMethod,
+		})
+
+		// Create overall progress reporter with estimated total
+		crawlProgress := progressManager.CreateReporter("crawl", "Crawling URLs", cfg.MaxURLs)
+		defer crawlProgress.Complete()
+
+		// Use the recursive crawling method for true multi-level crawling with configured batch size
+		startResp, err := c.StartBatchRecursiveCrawling(ctx, cfg.URL, nil, cfg.MaxDepth, cfg.MaxURLs, cfg.BatchSize)
 		if err != nil {
 			return errors.Wrap(err, errors.CrawlerError, "failed to start crawl")
 		}
@@ -171,70 +186,44 @@ to extract content from websites and store markdown and media files locally.`,
 			return errors.New(errors.CrawlerError, "no results returned from crawl")
 		}
 
-		appLogger.Info("Crawl completed successfully", map[string]interface{}{
-			"success": startResp.Success,
-			"count":   len(startResp.Results),
-			"serverProcessingTime": startResp.ServerProcessingTimeS,
-		})
+		// Update progress to show discovered URLs
+		crawlProgress.SetTotal(len(startResp.Results))
 
-		// Process the results
-		if len(startResp.Results) > 0 {
-			result := startResp.Results[0]
-			appLogger.Info("Crawl successful for URL", map[string]interface{}{"url": result.URL})
+		// Process all results
+		for i, result := range startResp.Results {
+			// Update progress
+			crawlProgress.SetCurrent(i + 1)
+			
+			if !result.Success {
+				appLogger.Warn("Skipping unsuccessful result", map[string]interface{}{"url": result.URL})
+				continue
+			}
+
+			appLogger.Info("Processing result", map[string]interface{}{"url": result.URL})
 
 			// Save markdown if available
 			if result.Markdown.RawMarkdown != "" {
 				markdownPath, err := storage.SaveMarkdown(result.Markdown.RawMarkdown, result.URL)
 				if err != nil {
-					appLogger.Error("Failed to save markdown", map[string]interface{}{"error": err})
+					appLogger.Error("Failed to save markdown", map[string]interface{}{"error": err, "url": result.URL})
 				} else {
-					appLogger.Info("Saved markdown", map[string]interface{}{"path": markdownPath.Path})
+					appLogger.Info("Saved markdown", map[string]interface{}{"path": markdownPath.Path, "url": result.URL})
 				}
 			}
 
 			// Save media files if available
 			if len(result.Media.Images) > 0 {
-				// Convert the synchronous response to the expected format for media download
-				mediaProgress := progressManager.CreateReporter("media", "Downloading media files", len(result.Media.Images))
+				// Create a response wrapper for this specific result
+				mediaStartResp := c.CreateSingleResultResponse(result)
+				
+				mediaProgress := progressManager.CreateReporter("media", fmt.Sprintf("Downloading media for %s", result.URL), len(result.Media.Images))
 				defer mediaProgress.Complete()
 				
-				// Create a temporary crawlResult structure for compatibility with media download function
-				tempCrawlResult := &crawler.CrawlResult{
-					Success: startResp.Success,
-					Results: []struct {
-						URL      string                     `json:"url"`
-						Success  bool                       `json:"success"`
-						HTML     string                     `json:"html"`
-						Markdown struct {
-							RawMarkdown string `json:"raw_markdown"`
-						} `json:"markdown"`
-						Media struct {
-							Images []struct {
-								URL string `json:"url"`
-							} `json:"images"`
-						} `json:"media"`
-						Metadata map[string]interface{} `json:"metadata,omitempty"`
-					}{
-						{
-							URL:      result.URL,
-							Success:  result.Success,
-							HTML:     result.HTML,
-							Markdown: struct {
-								RawMarkdown string `json:"raw_markdown"`
-							}{
-								RawMarkdown: result.Markdown.RawMarkdown,
-							},
-							Media:    result.Media,
-							Metadata: result.Metadata,
-						},
-					},
-				}
-				
-				mediaFiles, err := c.DownloadAndSaveMediaWithProgress(ctx, tempCrawlResult, mediaProgress)
+				mediaFiles, err := c.DownloadAndSaveMediaFromStartResponse(ctx, mediaStartResp, mediaProgress)
 				if err != nil {
-					appLogger.Error("Failed to save media files", map[string]interface{}{"error": err})
+					appLogger.Error("Failed to save media files", map[string]interface{}{"error": err, "url": result.URL})
 				} else {
-					appLogger.Info("Saved media files", map[string]interface{}{"count": len(mediaFiles)})
+					appLogger.Info("Saved media files", map[string]interface{}{"count": len(mediaFiles), "url": result.URL})
 				}
 			}
 		}
@@ -251,11 +240,18 @@ func init() {
 	rootCmd.Flags().StringVarP(&output, "output", "o", "", "The destination folder to store assets (required)")
 
 	// Add configuration flags
-	rootCmd.Flags().String("server-url", "http://192.168.1.27:11235/", "Crawl4ai server URL")
+	rootCmd.Flags().String("server-url", "http://192.168.1.27:8888/", "Crawl4ai server URL")
 	rootCmd.Flags().Int("timeout", 30, "Timeout for HTTP requests in seconds")
 	rootCmd.Flags().Int("max-concurrent", 5, "Maximum number of concurrent requests")
 	rootCmd.Flags().Bool("include-media", true, "Whether to include media files")
 	rootCmd.Flags().Bool("overwrite-files", false, "Whether to overwrite existing files")
+
+	// Add crawling configuration flags
+	rootCmd.Flags().Int("max-depth", 2, "Maximum crawling depth")
+	rootCmd.Flags().String("discovery-method", "auto", "URL discovery method (auto, sitemap, links)")
+	rootCmd.Flags().Int("batch-size", 5, "Number of URLs to process in each batch")
+	rootCmd.Flags().String("exclude-patterns", "", "Regex patterns to exclude from crawling")
+	rootCmd.Flags().Int("max-urls", 50, "Maximum number of URLs to crawl")
 
 	// Add logging configuration flags
 	rootCmd.Flags().String("log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR)")
